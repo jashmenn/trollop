@@ -5,7 +5,7 @@
 
 module Trollop
 
-VERSION = "1.3"
+VERSION = "1.6"
 
 ## Thrown by Parser in the event of a commandline error. Not needed if
 ## you're using the Trollop::options entry.
@@ -47,6 +47,7 @@ class Parser
     @long = {}
     @short = {}
     @order = []
+    @constraints = []
 
     #instance_eval(&b) if b # can't take arguments
     cloaker(&b).bind(self).call(*a) if b
@@ -130,27 +131,33 @@ class Parser
     raise ArgumentError, "long option name #{opts[:long].inspect} is already taken; please specify a (different) :long" if @long[opts[:long]]
 
     ## fill in :short
-    opts[:short] = opts[:short].to_s if opts[:short]
+    opts[:short] = opts[:short].to_s if opts[:short] unless opts[:short] == :none
     opts[:short] =
       case opts[:short]
       when nil
-        opts[:long].split(//).find { |c| c !~ /[\d]/ && !@short.member?(c) }
+        c = opts[:long].split(//).find { |c| c !~ /[\d]/ && !@short.member?(c) }
+        raise ArgumentError, "can't generate a short option name for #{opts[:long].inspect}: out of unique characters" unless c
+        c
       when /^-(.)$/
         $1
       when /^.$/
         opts[:short]
+      when :none
+        nil
       else
-        raise ArgumentError, "invalid short option name #{opts[:long].inspect}"
+        raise ArgumentError, "invalid short option name '#{opts[:short].inspect}'"
       end
-    raise ArgumentError, "can't generate a short option name (out of characters)" unless opts[:short]
-    raise ArgumentError, "short option name #{opts[:short].inspect} is already taken; please specify a (different) :short" if @short[opts[:short]]
-    raise ArgumentError, "a short option name can't be a number or a dash" if opts[:short] =~ /[\d-]/
+    if opts[:short]
+      raise ArgumentError, "short option name #{opts[:short].inspect} is already taken; please specify a (different) :short" if @short[opts[:short]]
+      raise ArgumentError, "a short option name can't be a number or a dash" if opts[:short] =~ /[\d-]/
+    end
 
     ## fill in :default for flags
     opts[:default] = false if opts[:type] == :flag && opts[:default].nil?
 
     opts[:desc] ||= desc
-    @short[opts[:short]] = @long[opts[:long]] = name
+    @long[opts[:long]] = name
+    @short[opts[:short]] = name if opts[:short]
     @specs[name] = opts
     @order << [:opt, name]
   end
@@ -163,6 +170,20 @@ class Parser
   ## Adds text to the help display.
   def banner s; @order << [:text, s] end
   alias :text :banner
+
+  ## Marks two (or more!) options as requiring each other. Only
+  ## handles undirected dependcies. Directed dependencies are better
+  ## modeled with #die.
+  def depends *syms
+    syms.each { |sym| raise ArgumentError, "unknown option '#{sym}'" unless @specs[sym] }
+    @constraints << [:depends, syms]
+  end
+  
+  ## Marks two (or more!) options as conflicting.
+  def conflicts *syms
+    syms.each { |sym| raise ArgumentError, "unknown option '#{sym}'" unless @specs[sym] }
+    @constraints << [:conflicts, syms]
+  end
 
   ## yield successive arg, parameter pairs
   def each_arg args # :nodoc:
@@ -204,7 +225,7 @@ class Parser
     remains
   end
 
-  def parse args #:nodoc:
+  def parse cmdline #:nodoc:
     vals = {}
     required = {}
     found = {}
@@ -212,13 +233,15 @@ class Parser
     opt :version, "Print version and exit" if @version unless @specs[:version] || @long["version"]
     opt :help, "Show this message" unless @specs[:help] || @long["help"]
 
-    @specs.each do |name, opts|
-      required[name] = true if opts[:required]
-      vals[name] = opts[:default]
+    @specs.each do |sym, opts|
+      required[sym] = true if opts[:required]
+      vals[sym] = opts[:default]
     end
 
-   @leftovers = each_arg args do |arg, param|
-      name = 
+    ## resolve symbols
+    args = []
+    @leftovers = each_arg cmdline do |arg, param|
+      sym = 
         case arg
         when /^-([^-])$/
           @short[$1]
@@ -227,49 +250,69 @@ class Parser
         else
           raise CommandlineError, "invalid argument syntax: '#{arg}'"
         end
-      raise CommandlineError, "unknown argument '#{arg}'" unless name
-      raise CommandlineError, "option '#{arg}' specified multiple times" if found[name]
+      raise CommandlineError, "unknown argument '#{arg}'" unless sym
+      raise CommandlineError, "option '#{arg}' specified multiple times" if found[sym]
+      args << [sym, arg, param]
+      found[sym] = true
 
-      raise VersionNeeded if name == :version
-      raise HelpNeeded if name == :help
+      @specs[sym][:type] != :flag # take params on all except flags
+    end
 
-      found[name] = true
-      opts = @specs[name]
+    ## check for version and help args
+    raise VersionNeeded if args.any? { |sym, *a| sym == :version }
+    raise HelpNeeded if args.any? { |sym, *a| sym == :help }
 
-      case opts[:type]
-      when :flag
-        vals[name] = !opts[:default]
-        false
-      when :int
-        raise CommandlineError, "option '#{arg}' needs a parameter" unless param
-        raise CommandlineError, "option '#{arg}' needs an integer" unless param =~ /^\d+$/
-        vals[name] = param.to_i
-        true
-      when :float
-        raise CommandlineError, "option '#{arg}' needs a parameter" unless param
-        raise CommandlineError, "option '#{arg}' needs a floating-point number" unless param =~ FLOAT_RE
-        vals[name] = param.to_f
-        true
-      when :string
-        raise CommandlineError, "option '#{arg}' needs a parameter" unless param
-        vals[name] = param
-        true
+    ## check constraint satisfaction
+    @constraints.each do |type, syms|
+      constraint_sym = syms.find { |sym| found[sym] }
+      next unless constraint_sym
+
+      case type
+      when :depends
+        syms.each { |sym| raise CommandlineError, "--#{@long[constraint_sym]} requires --#{@long[sym]}" unless found[sym] }
+      when :conflicts
+        syms.each { |sym| raise CommandlineError, "--#{@long[constraint_sym]} conflicts with --#{@long[sym]}" if found[sym] && sym != constraint_sym }
       end
     end
 
-    raise CommandlineError, "option '#{required.keys.first}' must be specified" if required.any? { |name, x| !found[name] }
+    raise CommandlineError, "option '#{required.keys.first}' must be specified" if required.any? { |sym, x| !found[sym] }
+
+    ## parse parameters
+    args.each do |sym, arg, param|
+      opts = @specs[sym]
+
+      raise CommandlineError, "option '#{arg}' needs a parameter" unless param || opts[:type] == :flag
+
+      case opts[:type]
+      when :flag
+        vals[sym] = !opts[:default]
+      when :int
+        raise CommandlineError, "option '#{arg}' needs an integer" unless param =~ /^\d+$/
+        vals[sym] = param.to_i
+      when :float
+        raise CommandlineError, "option '#{arg}' needs a floating-point number" unless param =~ FLOAT_RE
+        vals[sym] = param.to_f
+      when :string
+        vals[sym] = param.to_s
+      end
+    end
+
     vals
   end
 
   def width #:nodoc:
     @width ||= 
-      begin
-        require 'curses'
-        Curses::init_screen
-        x = Curses::cols
-        Curses::close_screen
-        x
-      rescue Exception
+      if $stdout.tty?
+        begin
+          require 'curses'
+          Curses::init_screen
+          x = Curses::cols
+          Curses::close_screen
+          x
+        rescue Exception
+          80
+        end
+      else
         80
       end
   end
@@ -281,7 +324,8 @@ class Parser
 
     left = {}
     @specs.each do |name, spec| 
-      left[name] = "--#{spec[:long]}, -#{spec[:short]}" + 
+      left[name] = "--#{spec[:long]}" +
+        (spec[:short] ? ", -#{spec[:short]}" : "") +
         case spec[:type]
         when :flag
           ""
@@ -415,7 +459,7 @@ end
 ##   Trollop::die "need at least one filename" if ARGV.empty?
 def die arg, msg=nil
   if msg
-    $stderr.puts "Error: parameter for option '--#{@p.specs[arg][:long]}' or '-#{@p.specs[arg][:short]}' #{msg}."
+    $stderr.puts "Error: argument --#{@p.specs[arg][:long]} #{msg}."
   else
     $stderr.puts "Error: #{arg}."
   end
