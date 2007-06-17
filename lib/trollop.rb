@@ -5,7 +5,7 @@
 
 module Trollop
 
-VERSION = "1.6"
+VERSION = "1.7"
 
 ## Thrown by Parser in the event of a commandline error. Not needed if
 ## you're using the Trollop::options entry.
@@ -275,7 +275,9 @@ class Parser
       end
     end
 
-    raise CommandlineError, "option '#{required.keys.first}' must be specified" if required.any? { |sym, x| !found[sym] }
+    required.each do |sym, val|
+      raise CommandlineError, "option '#{sym}' must be specified" unless found[sym]
+    end
 
     ## parse parameters
     args.each do |sym, arg, param|
